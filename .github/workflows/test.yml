@@ -1,7 +1,7 @@
 on: [push, pull_request]
 name: Test
 jobs:
-  build:
+  test:
     runs-on: ubuntu-latest
     steps:
     - name: Checkout code
@@ -10,9 +10,5 @@ jobs:
       uses: actions/setup-go@v2
       with:
         go-version: '1.13.0'
-    - name: Install hdf5
-      run: make install-hdf5 1>/dev/null 2>&1
     - name: Run tests
-      run: |
-        make test path=./lsh
-        make test path=./store/kv
+      run: make test

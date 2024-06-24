@@ -1,5 +1,6 @@
 DOWNLOAD=wget -P $(1) -nc $(2)
 ANNBENCH_DATA=./test-data
+TEST=go test -v -cover $(1) -count=1 -timeout=24h $(2) -run $(3)
 
 .SILENT:
 
@@ -9,29 +10,25 @@ download-annbench-data:
 	$(call DOWNLOAD,$(ANNBENCH_DATA),http://ann-benchmarks.com/fashion-mnist-784-euclidean.hdf5)
 	echo "=== Downloading NY times dataset... ==="
 	$(call DOWNLOAD,$(ANNBENCH_DATA),http://ann-benchmarks.com/nytimes-256-angular.hdf5)
+	echo "=== Downloading SIFT dataset... ==="
+	$(call DOWNLOAD,$(ANNBENCH_DATA),http://ann-benchmarks.com/sift-128-euclidean.hdf5)
+	echo "=== Downloading Glove dataset... ==="
+	$(call DOWNLOAD,$(ANNBENCH_DATA),http://ann-benchmarks.com/glove-200-angular.hdf5)
 	echo "=== Downloading complete ==="	
 
 .ONESHELL:
 .SHELLFLAGS=-e -c
 
 test:
-	path=$(path)
-	if [ -z "$$path" ]
-	then
-	    path=./...
-	fi
-	go test -v -cover -race -timeout=3600s -count=1 $(path)
+	$(call TEST,-race,./lsh,Test*)
+	$(call TEST,-race,./store/...,Test*)
+
+.PHONY: annbench
+annbench:
+	$(call TEST,,./annbench,$$test)
 
 install-hdf5:
-	mkdir -p /tmp/hdf5 && cd /tmp/hdf5
-	sudo apt-get install build-essential
-	wget -q ftp://ftp.unidata.ucar.edu/pub/netcdf/netcdf-4/hdf5-1.8.13.tar.gz
-	tar -xzf hdf5-1.8.13.tar.gz
-	cd /tmp/hdf5/hdf5-1.8.13
-	./configure  --prefix=/usr/local
-	make
-	sudo make install
-	rm -rf /tmp/hdf5/
+	sudo apt-get install libhdf5-serial-dev
 
 install-go-deps:
 	go get -t -u ./...

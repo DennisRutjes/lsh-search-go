@@ -2,9 +2,15 @@ package kv
 
 import (
 	"errors"
+	"fmt"
 	"github.com/gasparian/lsh-search-go/store"
 	guuid "github.com/google/uuid"
 	"sync"
+)
+
+var (
+	bucketNotFoundErr = errors.New("Bucket not found")
+	keyNotFoundErr    = errors.New("Key not found")
 )
 
 type KVStore struct {
@@ -19,21 +25,19 @@ func NewKVStore() *KVStore {
 }
 
 type KeysIterator struct {
-	idx    int
-	vecIds []string
+	vecIds chan string
 }
 
 func (it *KeysIterator) Next() (string, bool) {
-	if it.idx > len(it.vecIds)-1 {
+	vecId, opened := <-it.vecIds
+	if !opened {
 		return "", false
 	}
-	vecId := it.vecIds[it.idx]
-	it.idx++
 	return vecId, true
 }
 
 func getBucketName(perm int, hash uint64) string {
-	return string(perm) + "_" + string(hash)
+	return fmt.Sprintf("%v_%v", perm, hash)
 }
 
 func (s *KVStore) SetVector(id string, vec []float64) error {
@@ -49,15 +53,17 @@ func (s *KVStore) SetVector(id string, vec []float64) error {
 func (s *KVStore) GetVector(id string) ([]float64, error) {
 	s.mx.RLock()
 	defer s.mx.RUnlock()
-	vecTmp := s.m["vec"][id]
+	vecTmp, ok := s.m["vec"][id]
+	if !ok {
+		return nil, keyNotFoundErr
+	}
 	vec := vecTmp.([]float64)
 	return vec, nil
 }
 
-func (s *KVStore) SetHash(permutation int, hash uint64, vecId string) error {
+func (s *KVStore) SetHash(bucketName, vecId string) error {
 	s.mx.Lock()
 	defer s.mx.Unlock()
-	bucketName := getBucketName(permutation, hash)
 	if _, ok := s.m[bucketName]; !ok {
 		s.m[bucketName] = make(map[string]interface{})
 	}
@@ -66,24 +72,23 @@ func (s *KVStore) SetHash(permutation int, hash uint64, vecId string) error {
 	return nil
 }
 
-func (s *KVStore) GetHashIterator(permutation int, hash uint64) (store.Iterator, error) {
+func (s *KVStore) GetHashIterator(bucketName string) (store.Iterator, error) {
 	s.mx.RLock()
 	defer s.mx.RUnlock()
 
-	bucketName := getBucketName(permutation, hash)
-	val, ok := s.m[bucketName]
+	bucket, ok := s.m[bucketName]
 	if !ok {
-		return nil, errors.New("Bucket not found")
+		return nil, bucketNotFoundErr
 	}
-	i := 0
-	vecIds := make([]string, len(val))
-	for _, v := range val {
-		vecIds[i] = v.(string)
-		i++
-	}
+	hashCh := make(chan string)
+	go func() {
+		for _, v := range bucket {
+			hashCh <- v.(string)
+		}
+		close(hashCh)
+	}()
 	it := &KeysIterator{
-		idx:    0,
-		vecIds: vecIds,
+		vecIds: hashCh,
 	}
 	return it, nil
 }

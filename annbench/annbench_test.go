@@ -4,294 +4,293 @@ import (
 	bench "github.com/gasparian/lsh-search-go/annbench"
 	lsh "github.com/gasparian/lsh-search-go/lsh"
 	"github.com/gasparian/lsh-search-go/store/kv"
-	guuid "github.com/google/uuid"
-	"gonum.org/v1/hdf5"
-	// "math"
-	"path/filepath"
-	"sort"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
 
-type NNMockConfig struct {
-	DistanceThrsh float64
-	MaxNN         int
-}
+const (
+	tol = 1e-6
+)
 
-// TODO: use kv storage as in lsh indexer - to compare them more fair
-type NNMock struct {
-	mx             sync.RWMutex
-	config         NNMockConfig
-	index          map[string][]float64
-	distanceMetric lsh.Metric
-}
-
-func NewNNMock(config NNMockConfig, metric lsh.Metric) *NNMock {
-	return &NNMock{
-		config:         config,
-		index:          make(map[string][]float64),
-		distanceMetric: metric,
-	}
-}
-
-func (nn *NNMock) Train(records []lsh.Record) error {
-	nn.mx.Lock()
-	defer nn.mx.Unlock()
-
-	for _, rec := range records {
-		nn.index[rec.ID] = rec.Vec
-	}
-	return nil
-}
-
-func (nn *NNMock) Search(query []float64) ([]lsh.Record, error) {
-	nn.mx.RLock()
-	defer nn.mx.RUnlock()
-
-	closestSet := make(map[string]bool)
-	closest := make([]lsh.Record, 0)
-	for id, vec := range nn.index {
-		if len(closest) >= nn.config.MaxNN {
-			return closest, nil
-		}
-		if closestSet[id] {
-			continue
-		}
-		dist := nn.distanceMetric.GetDist(vec, query)
-		if dist <= nn.config.DistanceThrsh {
-			closestSet[id] = true
-			closest = append(closest, lsh.Record{ID: id, Vec: vec})
-		}
-	}
-	return closest, nil
-}
-
-type Indexer interface {
-	Train(records []lsh.Record) error
-	Search(query []float64) ([]lsh.Record, error)
-}
-
-type benchConfig struct {
-	datasetPath       string
-	sampleSize        int
-	batchSize         int
-	nPlanes           int
-	nPermutes         int
-	maxNN             int
-	trainDim          int
-	neighborsDim      int
-	metric            lsh.Metric
-	maxDist           float64
-	lshBiasMultiplier float64
-}
-
-type benchData struct {
-	train        []lsh.Record
-	test         [][]float64
-	trainIndices map[string]int
-	neighbors    [][]int
-	distances    [][]float64
-	mean         []float64
-	std          []float64
-}
-
-func prepHdf5BenchDataset(config *benchConfig) (*benchData, error) {
-	data := &benchData{}
-	absPath, _ := filepath.Abs(config.datasetPath)
-	f, err := hdf5.OpenFile(absPath, hdf5.F_ACC_RDONLY)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-
-	train := []float32{}
-	err = bench.GetVectorsFromHDF5(f, "train", &train)
-	if err != nil {
-		return nil, err
-	}
-	data.train = make([]lsh.Record, len(train)/config.trainDim)
-	for i := 0; i <= len(train)-config.trainDim; i = i + config.trainDim {
-		data.train[i/config.trainDim] = lsh.Record{
-			ID:  guuid.NewString(),
-			Vec: lsh.ConvertTo64(train[i : i+config.trainDim]),
-		}
-	}
-	train = nil
-
-	data.mean, data.std, err = lsh.GetMeanStd(data.train, config.sampleSize)
-	if err != nil {
-		return nil, err
-	}
-
-	test := []float32{}
-	err = bench.GetVectorsFromHDF5(f, "test", &test)
-	if err != nil {
-		return nil, err
-	}
-	data.test = make([][]float64, len(test)/config.trainDim)
-	for i := 0; i <= len(test)-config.trainDim; i = i + config.trainDim {
-		data.test[i/config.trainDim] = lsh.ConvertTo64(test[i : i+config.trainDim])
-	}
-	test = nil
-
-	neighbors := []int32{}
-	err = bench.GetVectorsFromHDF5(f, "neighbors", &neighbors)
-	if err != nil {
-		return nil, err
-	}
-	data.neighbors = make([][]int, len(neighbors)/config.neighborsDim)
-	for i := 0; i <= len(neighbors)-config.neighborsDim; i = i + config.neighborsDim {
-		arr := lsh.ConvertToInt(neighbors[i : i+config.neighborsDim])
-		sort.Ints(arr)
-		data.neighbors[i/config.neighborsDim] = arr
-	}
-	neighbors = nil
-
-	data.trainIndices = make(map[string]int)
-	for i := range data.train {
-		data.trainIndices[data.train[i].ID] = i
-	}
-
-	// distances := []float32{}
-	// err = bench.GetVectorsFromHDF5(f, "distances", &distances)
-	// if err != nil {
-	// 	return nil, err
-	// }
-	// data.distances = make([][]float64, len(distances)/config.neighborsDim)
-	// for i := 0; i <= len(distances)-config.neighborsDim; i = i + config.neighborsDim {
-	// 	data.distances[i/config.neighborsDim] = lsh.ConvertTo64(distances[i : i+config.neighborsDim])
-	// }
-	// distances = nil
-	data.distances = make([][]float64, 0)
-
-	return data, nil
-}
-
-func testIndexer(t *testing.T, indexer Indexer, data *benchData) {
+func testIndexer(t *testing.T, indexer lsh.Indexer, data *bench.BenchData, config *bench.SearchConfig) {
 	start := time.Now()
-	t.Log("Creating search index...")
-	indexer.Train(data.train)
+	t.Logf("Creating search index (%v vectors) ...", len(data.TrainVecs))
+	indexer.Train(data.TrainVecs, data.TrainIds)
 	t.Logf("Training finished in %v", time.Since(start))
 
 	t.Log("Predicting...")
-	precision, recall, avgPredTime := 0.0, 0.0, 0.0
-	for i := range data.test[:10] { // TODO:
-		start = time.Now()
-		closest, err := indexer.Search(data.test[i])
-		if err != nil {
-			t.Fatal(err)
+	start = time.Now()
+	N := 10000 // NOTE: for debug it's convenient to change this to lower value in sake of speed up (default is 10k)
+	batchSize := 1000
+	var elapsedTimeMs int64
+	predCh := make(chan bench.Prediction, N)
+	wg := sync.WaitGroup{}
+	for i := 0; i < len(data.Test[:N]); i += batchSize {
+		wg.Add(1)
+		end := i + batchSize
+		if end > len(data.Test[:N]) {
+			end = len(data.Test[:N])
 		}
-		closestPointsArr := make([]int, 0)
-		for _, cl := range closest {
-			closestPointsArr = append(closestPointsArr, data.trainIndices[cl.ID])
+		go func(batch [][]float64, startIdx int, wg *sync.WaitGroup) {
+			defer wg.Done()
+			for j := range batch {
+				start := time.Now()
+				closest, err := indexer.Search(batch[j], config.MaxNN, config.MaxDist)
+				if err != nil {
+					panic(err)
+				}
+				atomic.AddInt64(&elapsedTimeMs, int64(time.Since(start)/time.Millisecond))
+				predCh <- bench.Prediction{Neighbors: closest, Idx: startIdx + j}
+			}
+		}(data.Test[i:end], i, &wg)
+	}
+	wg.Wait()
+	close(predCh)
+
+	precision, recall := 0.0, 0.0
+	for pred := range predCh {
+		closestPointsIds := make([]int, 0)
+		for _, closest := range pred.Neighbors {
+			closestPointsIds = append(closestPointsIds, data.TrainIndices[closest.ID])
+			// if config.Metric.IsAngular() {
+			// 	pred.Neighbors[i].Dist = lsh.AngularToCosineDist(closest.Dist)
+			// }
 		}
-		// measure Recall
-		sort.Ints(closestPointsArr)
-		p, r := bench.PrecisionRecall(closestPointsArr, data.neighbors[i])
+		p, r := bench.DistanceBasedPrecisionRecall(
+			closestPointsIds,
+			data.Neighbors[pred.Idx][:config.MaxNN],
+			pred.Neighbors,
+			data.Distances[pred.Idx][:config.MaxNN],
+			config.Epsilon,
+		)
 		precision += p
 		recall += r
-		avgPredTime += float64(time.Since(start).Milliseconds())
 	}
-	// testDataLen := float64(len(data.test)) // TODO:
-	testDataLen := float64(10)
+	overallElapsedTime := time.Since(start)
+
+	testDataLen := float64(len(data.Test[:N]))
+
 	precision /= testDataLen
 	recall /= testDataLen
-	avgPredTime /= testDataLen
+	avgPredTime := float64(elapsedTimeMs) / testDataLen
 
 	t.Log("Done! Precision: ", precision, "Recall: ", recall)
+	t.Logf("Concurrent prediction finished in %v", overallElapsedTime)
 	t.Logf("Average prediction time is %v ms", avgPredTime)
 }
 
-func runBenchTest(t *testing.T, config *benchConfig, data *benchData) {
-	t.Run("NN", func(t *testing.T) {
-		nn := NewNNMock(NNMockConfig{
-			DistanceThrsh: config.maxDist,
-			MaxNN:         config.maxNN,
-		}, config.metric)
-		testIndexer(t, nn, data)
-	})
-
-	t.Run("LSH", func(t *testing.T) {
-		lshConfig := lsh.Config{
-			LshConfig: lsh.LshConfig{
-				DistanceThrsh: config.maxDist,
-				MaxNN:         config.maxNN,
-				BatchSize:     config.batchSize,
-			},
-			HasherConfig: lsh.HasherConfig{
-				NPermutes:      config.nPermutes,
-				NPlanes:        config.nPlanes,
-				BiasMultiplier: config.lshBiasMultiplier,
-				Dims:           config.trainDim,
-			},
-		}
-		lshConfig.Mean = data.mean
-		lshConfig.Std = data.std
-		s := kv.NewKVStore()
-		lshIndex, err := lsh.NewLsh(lshConfig, s, config.metric)
-		if err != nil {
-			t.Fatal(err)
-		}
-		testIndexer(t, lshIndex, data)
-	})
+func testNearestNeighbors(t *testing.T, config *bench.SearchConfig, data *bench.BenchData) {
+	s := kv.NewKVStore()
+	nn := bench.NewNNMock(config.MaxCandidates, s, config.Metric)
+	testIndexer(t, nn, data, config)
 }
 
-// func TestEuclidian(t *testing.T) {
-// 	config := &benchConfig{
-// 		datasetPath:       "../test-data/fashion-mnist-784-euclidean.hdf5",
-// 		sampleSize:        60000,
-// 		batchSize:         500,
-// 		nPlanes:           20,
-// 		nPermutes:         10,
-// 		maxNN:             100,
-// 		maxDist:           3000,
-// 		trainDim:          784,
-// 		neighborsDim:      100,
-// 		lshBiasMultiplier: 1.0,
-// 		metric:            lsh.NewL2(),
-// 	}
-// 	data, err := prepHdf5BenchDataset(config)
-// 	if err != nil {
-// 		t.Fatal(err)
-// 	}
-// 	runBenchTest(t, config, data)
-// }
-
-func TestAngular(t *testing.T) {
-	config := &benchConfig{
-		datasetPath:       "../test-data/nytimes-256-angular.hdf5",
-		sampleSize:        60000,
-		batchSize:         500,
-		nPlanes:           20,
-		nPermutes:         10,
-		maxNN:             100,
-		maxDist:           0.8,
-		trainDim:          256,
-		neighborsDim:      100,
-		lshBiasMultiplier: 1.0,
-		metric:            lsh.NewCosine(),
+func testLSH(t *testing.T, config *bench.SearchConfig, data *bench.BenchData) {
+	lshConfig := lsh.Config{
+		IndexConfig: lsh.IndexConfig{
+			BatchSize:     config.BatchSize,
+			MaxCandidates: config.MaxCandidates,
+		},
+		HasherConfig: lsh.HasherConfig{
+			NTrees:   config.NTrees,
+			KMinVecs: config.KMinVecs,
+			Dims:     config.NDims,
+		},
 	}
-	data, err := prepHdf5BenchDataset(config)
+	s := kv.NewKVStore()
+	lshIndex, err := lsh.NewLsh(lshConfig, s, config.Metric)
 	if err != nil {
 		t.Fatal(err)
 	}
-	data.std = []float64{}
-	// NOTE: optionally, you can measure distance without adjustment by passing empty mean array
-	data.mean = []float64{}
+	testIndexer(t, lshIndex, data, config)
+}
 
-	// NOTE: uncomment to look at the ground truth distances values
-	// min, max := math.MaxFloat64, 0.0
-	// for _, d := range data.distances {
-	// 	sorted := sort.Float64Slice(d)
-	// 	if sorted[0] < min {
-	// 		min = sorted[0]
-	// 	}
-	// 	if sorted[len(d)-1] > max {
-	// 		max = sorted[len(d)-1]
-	// 	}
-	// }
-	// t.Log(min, max)
+func TestEuclideanFashionMnist(t *testing.T) {
+	dataConfig := &bench.BenchDataConfig{
+		DatasetPath:  "../test-data/fashion-mnist-784-euclidean.hdf5",
+		SampleSize:   30000,
+		TrainDim:     784,
+		NeighborsDim: 100,
+	}
+	data, err := bench.PrepHdf5BenchDataset(dataConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
 
-	runBenchTest(t, config, data)
+	minStd, maxStd := bench.GetFloat64Range([][]float64{data.Std})
+	t.Log("Dimensions std's range: ", minStd, maxStd)
+
+	// NOTE: look at the ground truth distances values
+	minDist, maxDist := bench.GetFloat64Range(data.Distances)
+	t.Log("Ground truth distances range: ", minDist, maxDist)
+
+	config := &bench.SearchConfig{
+		Metric:        lsh.NewL2(),
+		MaxNN:         10,
+		MaxDist:       3000,
+		MaxCandidates: 60000,
+		Epsilon:       0.05,
+	}
+	// t.Run("NN", func(t *testing.T) {
+	// 	testNearestNeighbors(t, config, data)
+	// })
+
+	config = &bench.SearchConfig{
+		NDims:         784,
+		BatchSize:     500,
+		KMinVecs:      200,
+		NTrees:        10,
+		Metric:        lsh.NewL2(),
+		MaxNN:         10,
+		Epsilon:       0.05,
+		MaxDist:       2200,
+		MaxCandidates: 5000,
+	}
+	t.Run("LSH", func(t *testing.T) {
+		testLSH(t, config, data)
+	})
+}
+
+func TestEuclideanSift(t *testing.T) {
+	dataConfig := &bench.BenchDataConfig{
+		DatasetPath:  "../test-data/sift-128-euclidean.hdf5",
+		SampleSize:   200000,
+		TrainDim:     128,
+		NeighborsDim: 100,
+	}
+	data, err := bench.PrepHdf5BenchDataset(dataConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	minStd, maxStd := bench.GetFloat64Range([][]float64{data.Std})
+	t.Log("Dimensions std's range: ", minStd, maxStd)
+	minMean, maxMean := bench.GetFloat64Range([][]float64{data.Mean})
+	t.Log("Dimensions mean's range: ", minMean, maxMean)
+
+	// NOTE: look at the ground truth distances values
+	minDist, maxDist := bench.GetFloat64Range(data.Distances)
+	t.Log("Ground truth distances range: ", minDist, maxDist)
+
+	config := &bench.SearchConfig{
+		Metric:        lsh.NewL2(),
+		MaxNN:         10,
+		MaxDist:       400,
+		MaxCandidates: 1000000,
+		Epsilon:       0.05,
+	}
+
+	// t.Run("NN", func(t *testing.T) {
+	// 	testNearestNeighbors(t, config, data)
+	// })
+
+	config = &bench.SearchConfig{
+		Metric:        lsh.NewL2(),
+		NDims:         128,
+		BatchSize:     500,
+		NTrees:        40,
+		KMinVecs:      300,
+		MaxNN:         10,
+		MaxDist:       300,
+		Epsilon:       0.05,
+		MaxCandidates: 10000,
+	}
+	t.Run("LSH", func(t *testing.T) {
+		testLSH(t, config, data)
+	})
+}
+
+func TestAngularNYTimes(t *testing.T) {
+	dataConfig := &bench.BenchDataConfig{
+		DatasetPath:  "../test-data/nytimes-256-angular.hdf5",
+		SampleSize:   60000,
+		TrainDim:     256,
+		NeighborsDim: 100,
+	}
+	data, err := bench.PrepHdf5BenchDataset(dataConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	minStd, maxStd := bench.GetFloat64Range([][]float64{data.Std})
+	t.Log("Dimensions std's range: ", minStd, maxStd)
+	minMean, maxMean := bench.GetFloat64Range([][]float64{data.Mean})
+	t.Log("Dimensions mean's range: ", minMean, maxMean)
+
+	// NOTE: look at the ground truth distances values
+	minDist, maxDist := bench.GetFloat64Range(data.Distances)
+	t.Log("Ground truth distances range: ", minDist, maxDist)
+
+	config := &bench.SearchConfig{
+		Metric:        lsh.NewAngular(),
+		MaxNN:         10,
+		MaxDist:       0.85,
+		MaxCandidates: 290000,
+		Epsilon:       0.05,
+	}
+	// t.Run("NN", func(t *testing.T) {
+	// 	testNearestNeighbors(t, config, data)
+	// })
+
+	config = &bench.SearchConfig{
+		Metric:        lsh.NewAngular(),
+		NDims:         256,
+		BatchSize:     500,
+		NTrees:        200,
+		KMinVecs:      200,
+		MaxNN:         10,
+		MaxDist:       0.81,
+		Epsilon:       0.05,
+		MaxCandidates: 20000,
+	}
+	t.Run("LSH", func(t *testing.T) {
+		testLSH(t, config, data)
+	})
+}
+
+func TestAngularGlove(t *testing.T) {
+	dataConfig := &bench.BenchDataConfig{
+		DatasetPath:  "../test-data/glove-200-angular.hdf5",
+		SampleSize:   200000,
+		TrainDim:     200,
+		NeighborsDim: 100,
+	}
+	data, err := bench.PrepHdf5BenchDataset(dataConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	minStd, maxStd := bench.GetFloat64Range([][]float64{data.Std})
+	t.Log("Dimensions std's range: ", minStd, maxStd)
+	minMean, maxMean := bench.GetFloat64Range([][]float64{data.Mean})
+	t.Log("Dimensions mean's range: ", minMean, maxMean)
+
+	// NOTE: look at the ground truth distances values
+	minDist, maxDist := bench.GetFloat64Range(data.Distances)
+	t.Log("Ground truth distances range: ", minDist, maxDist)
+
+	config := &bench.SearchConfig{
+		Metric:        lsh.NewAngular(),
+		MaxNN:         10,
+		MaxDist:       0.75,
+		MaxCandidates: 1183514,
+		Epsilon:       0.05,
+	}
+	// t.Run("NN", func(t *testing.T) {
+	// 	testNearestNeighbors(t, config, data)
+	// })
+
+	config = &bench.SearchConfig{
+		Metric:        lsh.NewAngular(),
+		NDims:         200,
+		BatchSize:     500,
+		NTrees:        150,
+		KMinVecs:      300,
+		MaxNN:         10,
+		MaxDist:       0.75,
+		Epsilon:       0.05,
+		MaxCandidates: 20000,
+	}
+	t.Run("LSH", func(t *testing.T) {
+		testLSH(t, config, data)
+	})
 }
